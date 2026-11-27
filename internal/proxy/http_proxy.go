@@ -13,6 +13,7 @@ import (
 	"sync"
 
 	"github.com/secops/agbom-gate/internal/bom"
+	"github.com/secops/agbom-gate/internal/canon"
 	"github.com/secops/agbom-gate/internal/mcpclient"
 	"github.com/secops/agbom-gate/internal/telemetry"
 )
@@ -121,7 +122,7 @@ func (g *HTTPGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	serverName := strings.SplitN(strings.TrimPrefix(trimmed, "/"), "/", 2)[0]
 	if serverName == "" {
 		w.WriteHeader(http.StatusNotFound)
-		writeHTTPRPCError(w, nil, ErrCodeToolBlocked, "UNDECLARED_MCP_SERVER: missing server name in /mcp/{server-name}")
+		writeHTTPRPCError(w, json.RawMessage("null"), ErrCodeToolBlocked, "UNDECLARED_MCP_SERVER: missing server name in /mcp/{server-name}")
 		return
 	}
 	hp, ok := g.proxies[serverName]
@@ -135,7 +136,7 @@ func (g *HTTPGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Reason:       "undeclared MCP server requested at HTTP gateway",
 		})
 		w.WriteHeader(http.StatusNotFound)
-		writeHTTPRPCError(w, nil, ErrCodeToolBlocked, fmt.Sprintf("UNDECLARED_MCP_SERVER: %s", serverName))
+		writeHTTPRPCError(w, json.RawMessage("null"), ErrCodeToolBlocked, fmt.Sprintf("UNDECLARED_MCP_SERVER: %s", serverName))
 		return
 	}
 	hp.ServeHTTP(w, r)
@@ -172,12 +173,25 @@ func (p *HTTPQuarantineProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 func (p *HTTPQuarantineProxy) handlePost(w http.ResponseWriter, r *http.Request, traceParent string) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, 16*1024*1024))
 	if err != nil {
-		writeHTTPRPCError(w, nil, -32700, "read request body: "+err.Error())
+		writeHTTPRPCError(w, json.RawMessage("null"), -32700, "read request body: "+err.Error())
+		return
+	}
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		writeHTTPRPCError(w, json.RawMessage("null"), -32700, "empty JSON-RPC payload")
+		return
+	}
+	if trimmed[0] == '[' {
+		writeHTTPRPCError(w, json.RawMessage("null"), -32600, "invalid request: JSON-RPC batch arrays are not supported")
+		return
+	}
+	if _, err := canon.DecodeStrictJSON(trimmed); err != nil {
+		writeHTTPRPCError(w, json.RawMessage("null"), -32700, "invalid JSON-RPC payload: "+err.Error())
 		return
 	}
 	var msg rpcMsg
-	if err := json.Unmarshal(body, &msg); err != nil {
-		writeHTTPRPCError(w, nil, -32700, "invalid JSON-RPC payload")
+	if err := json.Unmarshal(trimmed, &msg); err != nil {
+		writeHTTPRPCError(w, json.RawMessage("null"), -32700, "invalid JSON-RPC payload")
 		return
 	}
 
@@ -190,10 +204,12 @@ func (p *HTTPQuarantineProxy) handlePost(w http.ResponseWriter, r *http.Request,
 			w.WriteHeader(http.StatusForbidden)
 			return
 		}
-		if _, err := p.forwardRawPost(r.Context(), body, traceParent); err != nil {
+		resp, err := p.forwardRawPost(r.Context(), trimmed, traceParent)
+		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
+		_ = resp.Body.Close()
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
@@ -229,10 +245,12 @@ func (p *HTTPQuarantineProxy) handlePost(w http.ResponseWriter, r *http.Request,
 		})
 
 	case "tools/call":
-		if code, errMsg, ok := p.core.AuthorizeToolCall(r.Context(), msg.Params, traceParent); !ok {
+		cleanParams, code, errMsg, ok := p.core.AuthorizeToolCall(r.Context(), msg.Params, traceParent)
+		if !ok {
 			writeHTTPRPCError(w, msg.ID, code, errMsg)
 			return
 		}
+		msg.Params = cleanParams
 		respMsg, sid, err := p.doUpstreamRPC(r.Context(), msg, traceParent)
 		if err != nil {
 			writeHTTPRPCError(w, msg.ID, -32603, err.Error())
@@ -259,11 +277,22 @@ func (p *HTTPQuarantineProxy) handlePost(w http.ResponseWriter, r *http.Request,
 func (p *HTTPQuarantineProxy) handleSSE(w http.ResponseWriter, r *http.Request, traceParent string) {
 	if p.core.State() == StateQuarantined {
 		w.WriteHeader(http.StatusForbidden)
-		writeHTTPRPCError(w, nil, ErrCodeQuarantined, "MCP_SERVER_QUARANTINED_HASH_MISMATCH")
+		writeHTTPRPCError(w, json.RawMessage("null"), ErrCodeQuarantined, "MCP_SERVER_QUARANTINED_HASH_MISMATCH")
 		return
 	}
 
-	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, p.cfg.EndpointURL, nil)
+	// Cancel the open SSE stream immediately if any concurrent request quarantines this server.
+	sseCtx, cancelSSE := context.WithCancel(r.Context())
+	defer cancelSSE()
+	go func() {
+		select {
+		case <-p.core.QuarantinedChan():
+			cancelSSE()
+		case <-sseCtx.Done():
+		}
+	}()
+
+	upReq, err := http.NewRequestWithContext(sseCtx, http.MethodGet, p.cfg.EndpointURL, nil)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -272,7 +301,7 @@ func (p *HTTPQuarantineProxy) handleSSE(w http.ResponseWriter, r *http.Request, 
 	if sid := p.getSessionID(); sid != "" {
 		upReq.Header.Set("Mcp-Session-Id", sid)
 	}
-	if err := p.applyUpstreamAuth(r.Context(), upReq); err != nil {
+	if err := p.applyUpstreamAuth(sseCtx, upReq); err != nil {
 		http.Error(w, "upstream auth failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -355,7 +384,10 @@ func (p *HTTPQuarantineProxy) handleSSE(w http.ResponseWriter, r *http.Request, 
 }
 
 func (p *HTTPQuarantineProxy) handleDelete(w http.ResponseWriter, r *http.Request) {
-	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodDelete, p.cfg.EndpointURL, nil)
+	reqCtx, cancel := context.WithTimeout(r.Context(), p.cfg.EffectiveRPCTimeout())
+	defer cancel()
+
+	upReq, err := http.NewRequestWithContext(reqCtx, http.MethodDelete, p.cfg.EndpointURL, nil)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -363,7 +395,7 @@ func (p *HTTPQuarantineProxy) handleDelete(w http.ResponseWriter, r *http.Reques
 	if sid := p.getSessionID(); sid != "" {
 		upReq.Header.Set("Mcp-Session-Id", sid)
 	}
-	if err := p.applyUpstreamAuth(r.Context(), upReq); err != nil {
+	if err := p.applyUpstreamAuth(reqCtx, upReq); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -420,11 +452,14 @@ func (p *HTTPQuarantineProxy) verifyAndFilterHTTP(ctx context.Context, tracePare
 }
 
 func (p *HTTPQuarantineProxy) doUpstreamRPC(ctx context.Context, req rpcMsg, traceParent string) (rpcMsg, string, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, p.cfg.EffectiveRPCTimeout())
+	defer cancel()
+
 	body, err := json.Marshal(req)
 	if err != nil {
 		return rpcMsg{}, "", err
 	}
-	resp, err := p.forwardRawPost(ctx, body, traceParent)
+	resp, err := p.forwardRawPost(reqCtx, body, traceParent)
 	if err != nil {
 		return rpcMsg{}, "", err
 	}

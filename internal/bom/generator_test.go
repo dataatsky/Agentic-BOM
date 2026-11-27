@@ -213,3 +213,26 @@ func TestA2ACardES256PEMAndJWKAndTamperFailsClosed(t *testing.T) {
 		t.Fatal("expected unsigned A2A card to fail when RequireSignedA2A=true")
 	}
 }
+
+func TestSymlinkEscapeAndMalformedPackageLockRejected(t *testing.T) {
+	// 1. Symlink inside prompts/ pointing outside RepoRoot must fail closed.
+	outsideDir := t.TempDir()
+	secretFile := filepath.Join(outsideDir, "outside_secret.txt")
+	_ = os.WriteFile(secretFile, []byte("TOP_SECRET"), 0600)
+
+	repoDir := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(repoDir, "prompts"), 0755)
+	if err := os.Symlink(secretFile, filepath.Join(repoDir, "prompts", "leak.md")); err != nil {
+		t.Fatalf("create symlink: %v", err)
+	}
+	if _, err := DiscoverRepo(DiscoverOptions{RepoRoot: repoDir}); err == nil {
+		t.Fatal("expected symlink escaping RepoRoot to be rejected")
+	}
+
+	// 2. Malformed package-lock.json must return an error instead of silently returning empty.
+	repoDir2 := t.TempDir()
+	_ = os.WriteFile(filepath.Join(repoDir2, "package-lock.json"), []byte("{not-valid-json"), 0644)
+	if _, err := DiscoverRepo(DiscoverOptions{RepoRoot: repoDir2}); err == nil {
+		t.Fatal("expected malformed package-lock.json to return error")
+	}
+}

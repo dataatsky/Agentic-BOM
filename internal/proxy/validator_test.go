@@ -163,3 +163,28 @@ func TestProxyRejectsInvalidArgumentsAgainstPinnedSchema(t *testing.T) {
 		t.Fatalf("expected agbom/tool_blocked telemetry for schema violation, got: %s", readLog())
 	}
 }
+
+func TestNullArgumentsTypelessObjectAndDuplicateKeyRejection(t *testing.T) {
+	// 1. Zero-arg object schema accepts "arguments": null from MCP clients.
+	zeroArgSchema, err := CompileInputSchema(json.RawMessage(`{"type":"object","additionalProperties":false}`))
+	if err != nil {
+		t.Fatalf("compile zeroArgSchema: %v", err)
+	}
+	if err := zeroArgSchema.ValidateArguments(json.RawMessage(`null`)); err != nil {
+		t.Fatalf("expected null arguments on zero-arg object schema to pass, got: %v", err)
+	}
+
+	// 2. Typeless schema with required/additionalProperties still enforces object type.
+	typelessSchema, err := CompileInputSchema(json.RawMessage(`{"required":["city"],"additionalProperties":false,"properties":{"city":{"type":"string"}}}`))
+	if err != nil {
+		t.Fatalf("compile typelessSchema: %v", err)
+	}
+	if err := typelessSchema.ValidateArguments(json.RawMessage(`["not","an","object"]`)); err == nil {
+		t.Fatal("expected array passed to typeless object schema to be rejected")
+	}
+
+	// 3. Duplicate object keys in arguments must be rejected to prevent parser differentials.
+	if err := typelessSchema.ValidateArguments(json.RawMessage(`{"city":"evil","city":"Madrid"}`)); err == nil {
+		t.Fatal("expected duplicate keys in arguments to be rejected")
+	}
+}

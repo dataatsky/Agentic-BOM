@@ -155,9 +155,13 @@ func isIdentChar(r rune) bool {
 // LintTool walks a raw MCP tool JSON object and checks for prompt-injection smuggling,
 // invisible/bidi Unicode, x-mcp-header misuse, unsafe schemas, and untrusted annotation mismatches.
 func LintTool(raw json.RawMessage) ([]Finding, error) {
-	var obj map[string]any
-	if err := json.Unmarshal(raw, &obj); err != nil {
-		return nil, fmt.Errorf("lint unmarshal tool: %w", err)
+	decoded, err := DecodeStrictJSON(raw)
+	if err != nil {
+		return nil, fmt.Errorf("lint decode tool: %w", err)
+	}
+	obj, ok := decoded.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("lint tool: expected json object, got %T", decoded)
 	}
 	toolName, _ := obj["name"].(string)
 
@@ -256,7 +260,13 @@ func walkValue(toolName, path string, v any, findings *[]Finding) {
 			walkValue(toolName, fmt.Sprintf("%s[%d]", path, i), elem, findings)
 		}
 	case map[string]any:
-		for k, val := range x {
+		keys := make([]string, 0, len(x))
+		for k := range x {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			val := x[k]
 			childPath := path + "." + k
 			lintUnicode(toolName, childPath+"(key)", k, findings)
 			if strings.EqualFold(k, "x-mcp-header") {

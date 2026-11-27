@@ -274,11 +274,11 @@ func Reconcile(declared *bom.BOM, observations []Observation) Result {
 				}
 			}
 
-			// 5. Undeclared tool invocation check
+			// 5. Undeclared tool invocation check (fail-closed: empty allowed_tools permits 0 tools unless '*').
 			if obs.ToolName != "" {
 				allowedVal, _ := svc.GetProperty(bom.PropAllowedTools)
-				allowed := bom.ParseCSVProperty(allowedVal)
-				if len(allowed) > 0 {
+				if strings.TrimSpace(allowedVal) != "*" {
+					allowed := bom.ParseCSVProperty(allowedVal)
 					if _, ok := allowed[obs.ToolName]; !ok {
 						addFinding(Finding{
 							Severity: "HIGH",

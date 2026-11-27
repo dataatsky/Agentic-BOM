@@ -46,10 +46,20 @@ type DiscoveryReport struct {
 // RAG/memory data-store manifests (agbom-stores.json, .agents/stores.json),
 // package lockfiles (go.mod, package-lock.json, requirements.txt, uv.lock),
 // and system prompt files, returning CycloneDX 1.6 components and static security findings.
+// All discovered files are verified via EvalSymlinks to reside strictly inside RepoRoot.
 func DiscoverRepo(opts DiscoverOptions) (*DiscoveryReport, error) {
 	if opts.RepoRoot == "" {
 		return nil, fmt.Errorf("repo root is required")
 	}
+	absRoot, err := filepath.Abs(opts.RepoRoot)
+	if err != nil {
+		return nil, fmt.Errorf("resolve repo root: %w", err)
+	}
+	realRoot, err := filepath.EvalSymlinks(absRoot)
+	if err != nil {
+		return nil, fmt.Errorf("eval repo root symlinks: %w", err)
+	}
+
 	report := &DiscoveryReport{}
 
 	// 1. Discover MCP client configs
@@ -60,13 +70,12 @@ func DiscoverRepo(opts DiscoverOptions) (*DiscoveryReport, error) {
 		filepath.Join(".claude", "claude_desktop_config.json"),
 	}
 	for _, rel := range mcpConfigPaths {
-		full := filepath.Join(opts.RepoRoot, rel)
-		raw, err := os.ReadFile(full)
+		raw, exists, err := readContainedOptionalFile(realRoot, filepath.Join(absRoot, rel))
 		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
 			return nil, fmt.Errorf("read %s: %w", rel, err)
+		}
+		if !exists {
+			continue
 		}
 		if err := parseMCPConfig(rel, raw, report); err != nil {
 			return nil, fmt.Errorf("parse %s: %w", rel, err)
@@ -79,13 +88,12 @@ func DiscoverRepo(opts DiscoverOptions) (*DiscoveryReport, error) {
 		"agent.json",
 	}
 	for _, rel := range a2aCardPaths {
-		full := filepath.Join(opts.RepoRoot, rel)
-		raw, err := os.ReadFile(full)
+		raw, exists, err := readContainedOptionalFile(realRoot, filepath.Join(absRoot, rel))
 		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
 			return nil, fmt.Errorf("read %s: %w", rel, err)
+		}
+		if !exists {
+			continue
 		}
 		if err := parseA2ACard(rel, raw, opts, report); err != nil {
 			return nil, err
@@ -98,13 +106,12 @@ func DiscoverRepo(opts DiscoverOptions) (*DiscoveryReport, error) {
 		filepath.Join(".agents", "stores.json"),
 	}
 	for _, rel := range storePaths {
-		full := filepath.Join(opts.RepoRoot, rel)
-		raw, err := os.ReadFile(full)
+		raw, exists, err := readContainedOptionalFile(realRoot, filepath.Join(absRoot, rel))
 		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
 			return nil, fmt.Errorf("read %s: %w", rel, err)
+		}
+		if !exists {
+			continue
 		}
 		if err := parseDataStores(rel, raw, report); err != nil {
 			return nil, fmt.Errorf("parse %s: %w", rel, err)
@@ -112,21 +119,21 @@ func DiscoverRepo(opts DiscoverOptions) (*DiscoveryReport, error) {
 	}
 
 	// 4. Discover package lockfiles into CycloneDX library components
-	if err := discoverLockfiles(opts.RepoRoot, report); err != nil {
+	if err := discoverLockfiles(absRoot, realRoot, report); err != nil {
 		return nil, err
 	}
 
 	// 5. Discover and hash system prompt files (exact raw bytes — never trimmed)
-	promptRelPaths := collectPromptFiles(opts.RepoRoot, opts.PromptFiles)
+	promptRelPaths := collectPromptFiles(absRoot, opts.PromptFiles)
 	for _, rel := range promptRelPaths {
 		full := rel
 		displayPath := rel
 		if !filepath.IsAbs(rel) {
-			full = filepath.Join(opts.RepoRoot, rel)
-		} else if r, err := filepath.Rel(opts.RepoRoot, rel); err == nil {
+			full = filepath.Join(absRoot, rel)
+		} else if r, err := filepath.Rel(absRoot, rel); err == nil {
 			displayPath = r
 		}
-		raw, err := os.ReadFile(full)
+		raw, err := readContainedRequiredFile(realRoot, full)
 		if err != nil {
 			return nil, fmt.Errorf("read prompt file %s: %w", displayPath, err)
 		}
@@ -143,6 +150,34 @@ func DiscoverRepo(opts DiscoverOptions) (*DiscoveryReport, error) {
 	}
 
 	return report, nil
+}
+
+// readContainedOptionalFile reads candidatePath only after verifying that its resolved
+// real path (following symlinks) stays inside realRoot.
+func readContainedOptionalFile(realRoot, candidatePath string) ([]byte, bool, error) {
+	if _, err := os.Lstat(candidatePath); err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	b, err := readContainedRequiredFile(realRoot, candidatePath)
+	if err != nil {
+		return nil, false, err
+	}
+	return b, true, nil
+}
+
+func readContainedRequiredFile(realRoot, candidatePath string) ([]byte, error) {
+	realTarget, err := filepath.EvalSymlinks(candidatePath)
+	if err != nil {
+		return nil, err
+	}
+	rel, err := filepath.Rel(realRoot, realTarget)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return nil, fmt.Errorf("path %q escapes repository root %q", candidatePath, realRoot)
+	}
+	return os.ReadFile(realTarget)
 }
 
 func parseDataStores(relPath string, raw []byte, report *DiscoveryReport) error {
@@ -182,7 +217,7 @@ func parseDataStores(relPath string, raw []byte, report *DiscoveryReport) error 
 	return nil
 }
 
-func discoverLockfiles(repoRoot string, report *DiscoveryReport) error {
+func discoverLockfiles(absRoot, realRoot string, report *DiscoveryReport) error {
 	seenPURL := map[string]struct{}{}
 	addLib := func(name, version, purl, src string) {
 		if name == "" || purl == "" {
@@ -204,21 +239,31 @@ func discoverLockfiles(repoRoot string, report *DiscoveryReport) error {
 	}
 
 	// go.mod
-	if raw, err := os.ReadFile(filepath.Join(repoRoot, "go.mod")); err == nil {
+	if raw, ok, err := readContainedOptionalFile(realRoot, filepath.Join(absRoot, "go.mod")); err != nil {
+		return fmt.Errorf("read go.mod: %w", err)
+	} else if ok {
 		for _, lib := range parseGoMod(raw) {
 			addLib(lib.name, lib.version, fmt.Sprintf("pkg:golang/%s@%s", lib.name, lib.version), "go.mod")
 		}
 	}
 
 	// package-lock.json
-	if raw, err := os.ReadFile(filepath.Join(repoRoot, "package-lock.json")); err == nil {
-		for _, lib := range parsePackageLock(raw) {
+	if raw, ok, err := readContainedOptionalFile(realRoot, filepath.Join(absRoot, "package-lock.json")); err != nil {
+		return fmt.Errorf("read package-lock.json: %w", err)
+	} else if ok {
+		libs, err := parsePackageLock(raw)
+		if err != nil {
+			return fmt.Errorf("parse package-lock.json: %w", err)
+		}
+		for _, lib := range libs {
 			addLib(lib.name, lib.version, fmt.Sprintf("pkg:npm/%s@%s", lib.name, lib.version), "package-lock.json")
 		}
 	}
 
 	// requirements.txt
-	if raw, err := os.ReadFile(filepath.Join(repoRoot, "requirements.txt")); err == nil {
+	if raw, ok, err := readContainedOptionalFile(realRoot, filepath.Join(absRoot, "requirements.txt")); err != nil {
+		return fmt.Errorf("read requirements.txt: %w", err)
+	} else if ok {
 		for _, lib := range parseRequirementsTxt(raw) {
 			purl := fmt.Sprintf("pkg:pypi/%s", lib.name)
 			if lib.version != "" {
@@ -229,7 +274,9 @@ func discoverLockfiles(repoRoot string, report *DiscoveryReport) error {
 	}
 
 	// uv.lock
-	if raw, err := os.ReadFile(filepath.Join(repoRoot, "uv.lock")); err == nil {
+	if raw, ok, err := readContainedOptionalFile(realRoot, filepath.Join(absRoot, "uv.lock")); err != nil {
+		return fmt.Errorf("read uv.lock: %w", err)
+	} else if ok {
 		for _, lib := range parseUVLock(raw) {
 			addLib(lib.name, lib.version, fmt.Sprintf("pkg:pypi/%s@%s", lib.name, lib.version), "uv.lock")
 		}
@@ -281,7 +328,7 @@ func parseGoMod(raw []byte) []pkgEntry {
 	return out
 }
 
-func parsePackageLock(raw []byte) []pkgEntry {
+func parsePackageLock(raw []byte) ([]pkgEntry, error) {
 	var doc struct {
 		Packages map[string]struct {
 			Version string `json:"version"`
@@ -291,7 +338,7 @@ func parsePackageLock(raw []byte) []pkgEntry {
 		} `json:"dependencies"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
-		return nil
+		return nil, err
 	}
 	seen := map[string]string{}
 	for path, info := range doc.Packages {
@@ -316,7 +363,7 @@ func parsePackageLock(raw []byte) []pkgEntry {
 		out = append(out, pkgEntry{name: k, version: v})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
-	return out
+	return out, nil
 }
 
 func parseRequirementsTxt(raw []byte) []pkgEntry {
@@ -423,7 +470,6 @@ func parseMCPConfig(relPath string, raw []byte, report *DiscoveryReport) error {
 			endpoint = entry.URL
 		}
 
-		// Flag hardcoded Authorization or token headers in repo MCP configs.
 		for hk := range entry.Headers {
 			lower := strings.ToLower(hk)
 			if lower == "authorization" || strings.Contains(lower, "token") || strings.Contains(lower, "api-key") {
@@ -491,7 +537,6 @@ func parseA2ACard(relPath string, raw []byte, opts DiscoverOptions, report *Disc
 		cardMeta.Version = "1.0.0"
 	}
 
-	// Static-lint the entire A2A Agent Card for invisible Unicode / bidi / prompt injection smuggling.
 	lintFindings, err := canon.LintTool(canonicalBytes)
 	if err == nil {
 		for _, f := range lintFindings {
@@ -561,9 +606,8 @@ func collectPromptFiles(repoRoot string, explicit []string) []string {
 		add(p)
 	}
 
-	// Auto-discover conventional prompt paths inside repoRoot.
 	for _, candidate := range []string{"system_prompt.md", "SYSTEM_PROMPT.md", "system_prompt.txt"} {
-		if _, err := os.Stat(filepath.Join(repoRoot, candidate)); err == nil {
+		if _, err := os.Lstat(filepath.Join(repoRoot, candidate)); err == nil {
 			add(candidate)
 		}
 	}

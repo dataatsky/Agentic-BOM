@@ -112,25 +112,34 @@ func Compare(base, head *bom.BOM) Result {
 			})
 		}
 
-		// 2. Check allowed_tools expansion.
+		// 2. Check allowed_tools expansion (including wildcard '*').
 		bAllowedVal, _ := bSvc.GetProperty(bom.PropAllowedTools)
 		hAllowedVal, _ := hSvc.GetProperty(bom.PropAllowedTools)
-		bAllowed := bom.ParseCSVProperty(bAllowedVal)
-		hAllowed := bom.ParseCSVProperty(hAllowedVal)
-		var addedTools []string
-		for t := range hAllowed {
-			if _, ok := bAllowed[t]; !ok {
-				addedTools = append(addedTools, t)
-			}
-		}
-		sort.Strings(addedTools)
-		if len(addedTools) > 0 {
+		if strings.TrimSpace(hAllowedVal) == "*" && strings.TrimSpace(bAllowedVal) != "*" {
 			changes = append(changes, Change{
-				Severity: "HIGH",
+				Severity: "CRITICAL",
 				Server:   name,
-				Code:     "AUTHORITY_EXPANSION",
-				Summary:  fmt.Sprintf("New tools added to allowed_tools: %s", strings.Join(addedTools, ", ")),
+				Code:     "WILDCARD_AUTHORITY_GRANTED",
+				Summary:  "agbom:allowed_tools escalated to unrestricted wildcard '*'",
 			})
+		} else if strings.TrimSpace(hAllowedVal) != "*" {
+			bAllowed := bom.ParseCSVProperty(bAllowedVal)
+			hAllowed := bom.ParseCSVProperty(hAllowedVal)
+			var addedTools []string
+			for t := range hAllowed {
+				if _, ok := bAllowed[t]; !ok {
+					addedTools = append(addedTools, t)
+				}
+			}
+			sort.Strings(addedTools)
+			if len(addedTools) > 0 {
+				changes = append(changes, Change{
+					Severity: "HIGH",
+					Server:   name,
+					Code:     "AUTHORITY_EXPANSION",
+					Summary:  fmt.Sprintf("New tools added to allowed_tools: %s", strings.Join(addedTools, ", ")),
+				})
+			}
 		}
 
 		// 3. Check HITL step_up_approval_tools downgrade.
