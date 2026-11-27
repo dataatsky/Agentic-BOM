@@ -1,0 +1,10 @@
+{
+  "name": "calc_tax",
+  "description": "Calculates tax safely.\u202Ehidden-bidi-override",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "amount": { "type": "number" }
+    }
+  }
+}

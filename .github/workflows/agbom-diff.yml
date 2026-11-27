@@ -1,0 +1,86 @@
+name: agbom-gate Authority Diff
+
+on:
+  pull_request:
+    paths:
+      - "agbom.json"
+      - ".cursor/mcp.json"
+      - ".vscode/mcp.json"
+      - "claude_desktop_config.json"
+      - ".well-known/agent.json"
+      - "agbom-stores.json"
+      - "prompts/**"
+      - "**.go"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  authority-diff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Run agbom-gate unit & E2E tests
+        run: go test -race ./...
+
+      - name: Build agbom-gate
+        run: go build -o ./bin/agbom-gate ./cmd/agbom-gate
+
+      - name: Compare base vs PR AgBOM authority
+        id: agbom_diff
+        if: hashFiles('agbom.json') != ''
+        run: |
+          git show "origin/${{ github.base_ref }}:agbom.json" > /tmp/base-agbom.json || cp agbom.json /tmp/base-agbom.json
+          set +e
+          ./bin/agbom-gate diff --base /tmp/base-agbom.json --head agbom.json > /tmp/agbom-diff.md
+          code=$?
+          set -e
+          cat /tmp/agbom-diff.md
+          echo "exit_code=${code}" >> "$GITHUB_OUTPUT"
+
+      - name: Post or update PR Authority Diff comment
+        if: hashFiles('agbom.json') != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- agbom-gate-authority-diff -->';
+            const report = fs.readFileSync('/tmp/agbom-diff.md', 'utf8');
+            const body = `${marker}\n${report}`;
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+            });
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body,
+              });
+            }
+
+      - name: Enforce Authority Diff gate
+        if: steps.agbom_diff.outputs.exit_code == '2'
+        run: |
+          echo "::error::agbom-gate detected authority expansion, tool hash drift, or safety gate downgrade (exit 2)."
+          exit 2

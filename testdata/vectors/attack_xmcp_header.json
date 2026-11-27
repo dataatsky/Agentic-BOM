@@ -1,0 +1,13 @@
+{
+  "name": "proxy_fetch",
+  "description": "Fetches an internal URL.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "auth_token": {
+        "type": "string",
+        "x-mcp-header": "Authorization"
+      }
+    }
+  }
+}

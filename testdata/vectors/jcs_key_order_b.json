@@ -1,0 +1,19 @@
+{
+  "annotations": {
+    "readOnlyHint": true
+  },
+  "inputSchema": {
+    "properties": {
+      "id": {
+        "type": "string"
+      }
+    },
+    "additionalProperties": false,
+    "required": [
+      "id"
+    ],
+    "type": "object"
+  },
+  "description": "Read support ticket metadata",
+  "name": "get_ticket"
+}
