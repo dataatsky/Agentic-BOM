@@ -7,8 +7,11 @@ on:
       - ".cursor/mcp.json"
       - ".vscode/mcp.json"
       - "claude_desktop_config.json"
+      - ".claude/claude_desktop_config.json"
       - ".well-known/agent.json"
+      - "agent.json"
       - "agbom-stores.json"
+      - ".agents/stores.json"
       - "prompts/**"
       - "**.go"
 
@@ -37,12 +40,25 @@ jobs:
       - name: Compare base vs PR AgBOM authority
         id: agbom_diff
         if: hashFiles('agbom.json') != ''
+        env:
+          BASE_REF: ${{ github.base_ref }}
         run: |
-          git show "origin/${{ github.base_ref }}:agbom.json" > /tmp/base-agbom.json || cp agbom.json /tmp/base-agbom.json
+          if ! git show "origin/${BASE_REF}:agbom.json" > /tmp/base-agbom.json 2>/dev/null; then
+            printf '{"bomFormat":"CycloneDX","specVersion":"1.6","version":1,"components":[]}\n' > /tmp/base-agbom.json
+          fi
           set +e
-          ./bin/agbom-gate diff --base /tmp/base-agbom.json --head agbom.json > /tmp/agbom-diff.md
+          ./bin/agbom-gate diff --base /tmp/base-agbom.json --head agbom.json > /tmp/agbom-diff.md 2> /tmp/agbom-diff.err
           code=$?
           set -e
+          if [ "${code}" -eq 1 ]; then
+            {
+              echo "## agbom-gate Authority Diff: ERROR (Invalid AgBOM)"
+              echo ""
+              echo '```text'
+              cat /tmp/agbom-diff.err
+              echo '```'
+            } > /tmp/agbom-diff.md
+          fi
           cat /tmp/agbom-diff.md
           echo "exit_code=${code}" >> "$GITHUB_OUTPUT"
 
@@ -80,7 +96,9 @@ jobs:
             }
 
       - name: Enforce Authority Diff gate
-        if: steps.agbom_diff.outputs.exit_code == '2'
+        if: hashFiles('agbom.json') != '' && steps.agbom_diff.outputs.exit_code != '0'
+        env:
+          DIFF_EXIT: ${{ steps.agbom_diff.outputs.exit_code }}
         run: |
-          echo "::error::agbom-gate detected authority expansion, tool hash drift, or safety gate downgrade (exit 2)."
-          exit 2
+          echo "::error::agbom-gate failed PR check with exit code ${DIFF_EXIT}."
+          exit "${DIFF_EXIT}"

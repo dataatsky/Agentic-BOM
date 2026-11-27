@@ -186,3 +186,15 @@ func TestSystemPromptAndA2ACardDrift(t *testing.T) {
 		}
 	}
 }
+
+func TestWildcardAuthorityEscalationBlocked(t *testing.T) {
+	base := makeTestBOM("aaa", "get_ticket", "", "")
+	head := makeTestBOM("aaa", "*", "", "")
+	res := Compare(base, head)
+	if res.ExitCode != 2 {
+		t.Fatalf("expected exit 2 on wildcard allowed_tools escalation, got %d", res.ExitCode)
+	}
+	if !strings.Contains(res.Markdown, "WILDCARD_AUTHORITY_GRANTED") {
+		t.Fatalf("expected WILDCARD_AUTHORITY_GRANTED in diff markdown, got:\n%s", res.Markdown)
+	}
+}

@@ -13,23 +13,105 @@ import (
 	"unicode/utf16"
 )
 
-// JCS transforms a valid JSON document into its RFC 8785 JSON Canonicalization Scheme byte sequence.
-// It preserves all object keys (including unmodeled/_meta fields) and exact string contents verbatim.
-func JCS(raw []byte) ([]byte, error) {
+// DecodeStrictJSON decodes a single JSON value using json.Number while strictly rejecting:
+//  1. Duplicate object keys at any nesting depth (RFC 8785 Section 3.1 / I-JSON compliance,
+//     preventing last-key-wins vs first-key-wins parser differential attacks).
+//  2. Trailing tokens or garbage after the root JSON value.
+func DecodeStrictJSON(raw []byte) (any, error) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
 
-	var val any
-	if err := dec.Decode(&val); err != nil {
-		return nil, fmt.Errorf("decode json: %w", err)
+	val, err := decodeStrictValue(dec)
+	if err != nil {
+		return nil, err
 	}
-	// Reject trailing garbage after the root JSON value.
-	var extra any
-	if err := dec.Decode(&extra); err != io.EOF {
+	if tok, err := dec.Token(); err != io.EOF {
 		if err == nil {
-			return nil, errors.New("unexpected trailing json token")
+			return nil, fmt.Errorf("unexpected trailing json token %v", tok)
 		}
 		return nil, fmt.Errorf("invalid trailing json: %w", err)
+	}
+	return val, nil
+}
+
+func decodeStrictValue(dec *json.Decoder) (any, error) {
+	tok, err := dec.Token()
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("decode json: %w", io.ErrUnexpectedEOF)
+		}
+		return nil, fmt.Errorf("decode json: %w", err)
+	}
+	return decodeStrictFromToken(dec, tok)
+}
+
+func decodeStrictFromToken(dec *json.Decoder, tok json.Token) (any, error) {
+	switch v := tok.(type) {
+	case json.Delim:
+		switch v {
+		case '{':
+			obj := make(map[string]any)
+			for dec.More() {
+				kt, err := dec.Token()
+				if err != nil {
+					return nil, fmt.Errorf("decode object key: %w", err)
+				}
+				key, ok := kt.(string)
+				if !ok {
+					return nil, fmt.Errorf("expected string object key, got %T", kt)
+				}
+				if _, dup := obj[key]; dup {
+					return nil, fmt.Errorf("duplicate json object key %q", key)
+				}
+				val, err := decodeStrictValue(dec)
+				if err != nil {
+					return nil, err
+				}
+				obj[key] = val
+			}
+			endTok, err := dec.Token()
+			if err != nil {
+				return nil, fmt.Errorf("decode object end: %w", err)
+			}
+			if endTok != json.Delim('}') {
+				return nil, fmt.Errorf("expected '}', got %v", endTok)
+			}
+			return obj, nil
+
+		case '[':
+			arr := make([]any, 0)
+			for dec.More() {
+				elem, err := decodeStrictValue(dec)
+				if err != nil {
+					return nil, err
+				}
+				arr = append(arr, elem)
+			}
+			endTok, err := dec.Token()
+			if err != nil {
+				return nil, fmt.Errorf("decode array end: %w", err)
+			}
+			if endTok != json.Delim(']') {
+				return nil, fmt.Errorf("expected ']', got %v", endTok)
+			}
+			return arr, nil
+
+		default:
+			return nil, fmt.Errorf("unexpected delimiter %q", v)
+		}
+	default:
+		// nil, bool, json.Number, string
+		return v, nil
+	}
+}
+
+// JCS transforms a valid JSON document into its RFC 8785 JSON Canonicalization Scheme byte sequence.
+// It rejects duplicate object keys (I-JSON) and preserves all object keys (including unmodeled/_meta fields)
+// and exact string contents verbatim.
+func JCS(raw []byte) ([]byte, error) {
+	val, err := DecodeStrictJSON(raw)
+	if err != nil {
+		return nil, err
 	}
 
 	var buf bytes.Buffer

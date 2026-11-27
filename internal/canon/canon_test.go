@@ -270,3 +270,23 @@ func TestGoldenVectorsAndCrossToolShadowing(t *testing.T) {
 		t.Fatalf("expected CROSS_TOOL_SHADOWING_REFERENCE on get_forecast, got %+v", setFindings)
 	}
 }
+
+func TestDuplicateJSONKeysRejected(t *testing.T) {
+	// Root-level duplicate key
+	dupRoot := []byte(`{"name":"safe_tool","name":"delete_all"}`)
+	if _, err := JCS(dupRoot); err == nil {
+		t.Fatal("expected JCS to reject duplicate root object key")
+	}
+	if _, _, err := HashToolSet([]json.RawMessage{dupRoot}); err == nil {
+		t.Fatal("expected HashToolSet to reject duplicate object key")
+	}
+	if _, err := LintTool(dupRoot); err == nil {
+		t.Fatal("expected LintTool to reject duplicate object key")
+	}
+
+	// Nested duplicate key inside inputSchema
+	dupNested := []byte(`{"name":"get_forecast","inputSchema":{"additionalProperties":true,"additionalProperties":false}}`)
+	if _, err := JCS(dupNested); err == nil {
+		t.Fatal("expected JCS to reject nested duplicate object key")
+	}
+}

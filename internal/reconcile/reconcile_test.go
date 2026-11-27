@@ -81,3 +81,29 @@ func TestReconcileDetectsShadowServersToolsStoresAndDrift(t *testing.T) {
 		}
 	}
 }
+
+func TestReconcileEmptyAllowedToolsFailsClosed(t *testing.T) {
+	declared := &bom.BOM{
+		BOMFormat:   "CycloneDX",
+		SpecVersion: "1.6",
+		Components: []bom.Component{
+			{
+				Type: "service",
+				Name: "weather-mcp",
+				Properties: []bom.Property{
+					{Name: bom.PropToolsListSHA256, Value: "aaaa1111aaaa1111"},
+					{Name: bom.PropAllowedTools, Value: ""},
+				},
+			},
+		},
+	}
+
+	obs, err := ParseTelemetry([]byte(`{"event_type":"agbom/tool_blocked","server_name":"weather-mcp","tool_name":"get_forecast"}` + "\n"))
+	if err != nil {
+		t.Fatalf("ParseTelemetry: %v", err)
+	}
+	res := Reconcile(declared, obs)
+	if res.ExitCode != 2 || !strings.Contains(res.Markdown, "UNDECLARED_TOOL_CALL") {
+		t.Fatalf("expected empty allowed_tools to fail closed with UNDECLARED_TOOL_CALL, got exit=%d:\n%s", res.ExitCode, res.Markdown)
+	}
+}

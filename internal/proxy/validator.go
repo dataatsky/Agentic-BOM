@@ -3,9 +3,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"math"
 	"regexp"
 	"sort"
@@ -50,10 +48,8 @@ func CompileInputSchema(raw json.RawMessage) (*CompiledSchema, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil, nil
 	}
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-	var node any
-	if err := dec.Decode(&node); err != nil {
+	node, err := canon.DecodeStrictJSON(raw)
+	if err != nil {
 		return nil, fmt.Errorf("decode inputSchema: %w", err)
 	}
 	return compileSchemaNode(node)
@@ -222,25 +218,37 @@ func compileSchemaList(raw any) ([]*CompiledSchema, error) {
 	return out, nil
 }
 
-// ValidateArguments validates a raw JSON params.arguments payload against the compiled schema.
-// If argsRaw is empty or omitted, it is treated as an empty object {} for object schemas.
-func (s *CompiledSchema) ValidateArguments(argsRaw json.RawMessage) error {
-	if s == nil {
-		return nil
+func (s *CompiledSchema) allowsNull() bool {
+	for _, t := range s.types {
+		if t == "null" {
+			return true
+		}
 	}
+	return false
+}
+
+func (s *CompiledSchema) impliesObjectType() bool {
+	return len(s.required) > 0 || len(s.properties) > 0 || s.hasAdditionalProps
+}
+
+func (s *CompiledSchema) impliesArrayType() bool {
+	return s.items != nil || s.minItems != nil || s.maxItems != nil || s.uniqueItems
+}
+
+// ValidateArguments validates a raw JSON params.arguments payload against the compiled schema,
+// strictly rejecting duplicate object keys at any nesting level.
+// If argsRaw is empty or "null" (when null is not explicitly allowed), it is normalized to {}.
+func (s *CompiledSchema) ValidateArguments(argsRaw json.RawMessage) error {
 	trimmed := bytes.TrimSpace(argsRaw)
-	if len(trimmed) == 0 {
+	if len(trimmed) == 0 || (bytes.Equal(trimmed, []byte("null")) && (s == nil || !s.allowsNull())) {
 		trimmed = []byte("{}")
 	}
-	dec := json.NewDecoder(bytes.NewReader(trimmed))
-	dec.UseNumber()
-	var val any
-	if err := dec.Decode(&val); err != nil {
-		return fmt.Errorf("$.arguments: invalid json: %w", err)
+	val, err := canon.DecodeStrictJSON(trimmed)
+	if err != nil {
+		return fmt.Errorf("$.arguments: %w", err)
 	}
-	var extra any
-	if err := dec.Decode(&extra); err != io.EOF {
-		return errors.New("$.arguments: unexpected trailing json token")
+	if s == nil {
+		return nil
 	}
 	return s.validateValue("$.arguments", val)
 }
@@ -256,6 +264,14 @@ func (s *CompiledSchema) validateValue(path string, val any) error {
 		}
 		if !matched {
 			return fmt.Errorf("%s: expected type %s, got %s", path, strings.Join(s.types, "|"), actualJSONType(val))
+		}
+	} else {
+		// Enforce implied container types when schema omits explicit "type".
+		if s.impliesObjectType() && !matchesJSONType(val, "object") {
+			return fmt.Errorf("%s: expected type object, got %s", path, actualJSONType(val))
+		}
+		if s.impliesArrayType() && !matchesJSONType(val, "array") {
+			return fmt.Errorf("%s: expected type array, got %s", path, actualJSONType(val))
 		}
 	}
 
@@ -355,7 +371,6 @@ func (s *CompiledSchema) validateValue(path string, val any) error {
 				return fmt.Errorf("%s: missing required property %q", path, reqKey)
 			}
 		}
-		// Sort keys for deterministic error reporting.
 		keys := make([]string, 0, len(x))
 		for k := range x {
 			keys = append(keys, k)

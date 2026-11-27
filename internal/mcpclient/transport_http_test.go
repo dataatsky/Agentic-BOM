@@ -84,3 +84,23 @@ func TestFetchToolsHTTPPaginatedAndSSE(t *testing.T) {
 		}
 	}
 }
+
+func TestSplitCommandArgsQuotesAndEscapes(t *testing.T) {
+	got, err := SplitCommandArgs(`--mode=clean --config "/path/with spaces/mcp.json" '--tag=a b' escaped\ arg`)
+	if err != nil {
+		t.Fatalf("SplitCommandArgs: %v", err)
+	}
+	want := []string{"--mode=clean", "--config", "/path/with spaces/mcp.json", "--tag=a b", "escaped arg"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("arg[%d]: got %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	if _, err := SplitCommandArgs(`--config "unterminated`); err == nil {
+		t.Fatal("expected error on unterminated quote")
+	}
+}

@@ -96,14 +96,14 @@ func runScan(args []string) {
 	fs := flag.NewFlagSet("scan", flag.ExitOnError)
 	serverName := fs.String("server-name", "mcp-server", "Logical MCP server name")
 	cmdBin := fs.String("cmd", "", "Stdio MCP server executable")
-	cmdArgs := fs.String("args", "", "Space-separated arguments for MCP server")
+	cmdArgs := fs.String("args", "", "Arguments for MCP server (supports single/double quotes)")
 	endpointURL := fs.String("url", "", "Streamable HTTP MCP endpoint URL")
 	repoDir := fs.String("repo", "", "Optional repository root to discover MCP configs, lockfiles, data stores, A2A cards, and prompts")
-	probeDiscovered := fs.Bool("probe-discovered", false, "Automatically probe discovered MCP targets in --repo to pin live tools/list SHA-256 hashes")
+	probeDiscovered := fs.Bool("probe-discovered", false, "Automatically probe discovered MCP targets in --repo to pin live tools/list SHA-256 hashes (only run on trusted repositories)")
 	promptFiles := fs.String("prompt-files", "", "Optional comma-separated system prompt file paths to hash")
 	a2aPubKeyPath := fs.String("a2a-pub-key", "", "Public key (PEM/JWK/base64) to verify discovered A2A Agent Card JWS")
 	requireSignedA2A := fs.Bool("require-signed-a2a", true, "Fail scan if a discovered A2A Agent Card is unsigned or has an invalid JWS")
-	allowedTools := fs.String("allowed-tools", "", "Comma-separated allowlisted tool names")
+	allowedTools := fs.String("allowed-tools", "", "Comma-separated allowlisted tool names (or '*' for explicit wildcard)")
 	stepUpTools := fs.String("step-up-tools", "", "Comma-separated tools requiring HITL step-up")
 	nhiPrincipal := fs.String("nhi-principal", "", "Optional SPIFFE/NHI principal recorded in AgBOM metadata")
 	owner := fs.String("owner", "", "Optional owner email/team recorded in AgBOM metadata")
@@ -124,6 +124,7 @@ func runScan(args []string) {
 	}
 
 	var components []bom.Component
+	directScannedServices := map[string]struct{}{}
 	hasCritical := false
 	totalTools := 0
 	compositeSummary := ""
@@ -151,9 +152,9 @@ func runScan(args []string) {
 			cfg.EndpointURL = *endpointURL
 			rawTools, err = mcpclient.FetchToolsHTTP(context.Background(), cfg)
 		} else {
-			var splitArgs []string
-			if strings.TrimSpace(*cmdArgs) != "" {
-				splitArgs = strings.Fields(*cmdArgs)
+			splitArgs, splitErr := mcpclient.SplitCommandArgs(*cmdArgs)
+			if splitErr != nil {
+				fatal("parse --args: %v", splitErr)
 			}
 			rawTools, err = mcpclient.FetchToolsStdio(*cmdBin, splitArgs)
 		}
@@ -198,6 +199,7 @@ func runScan(args []string) {
 			Version:    "1.0.0",
 			Properties: props,
 		})
+		directScannedServices[*serverName] = struct{}{}
 	}
 
 	// 2. Repo Discovery (MCP configs, lockfiles, data stores, A2A Agent Cards + JWS, system prompts)
@@ -240,6 +242,9 @@ func runScan(args []string) {
 			probedTools := make(map[string][]json.RawMessage, len(report.MCPTargets))
 			var allPeerNames []string
 			for _, target := range report.MCPTargets {
+				if _, alreadyScanned := directScannedServices[target.Name]; alreadyScanned {
+					continue
+				}
 				var rawTools []json.RawMessage
 				var err error
 				if target.Transport == "streamable-http" && target.URL != "" {
@@ -290,6 +295,18 @@ func runScan(args []string) {
 				}
 				pinsJSON, _ := json.Marshal(pins)
 				c.Version = "1.0.0"
+				if strings.TrimSpace(*allowedTools) != "" {
+					c.SetProperty(bom.PropAllowedTools, *allowedTools)
+				} else {
+					names := make([]string, 0, len(pins))
+					for _, p := range pins {
+						names = append(names, p.Name)
+					}
+					c.SetProperty(bom.PropAllowedTools, strings.Join(names, ","))
+				}
+				if strings.TrimSpace(*stepUpTools) != "" {
+					c.SetProperty(bom.PropStepUpTools, *stepUpTools)
+				}
 				c.SetProperty(bom.PropToolsListSHA256, compHash)
 				c.SetProperty(bom.PropToolPinsJSON, string(pinsJSON))
 				totalTools += len(pins)
@@ -297,7 +314,15 @@ func runScan(args []string) {
 			}
 		}
 
-		components = append(components, report.Components...)
+		// Deduplicate against any service already scanned directly via --cmd / --url.
+		for _, c := range report.Components {
+			if c.Type == "service" {
+				if _, dup := directScannedServices[c.Name]; dup {
+					continue
+				}
+			}
+			components = append(components, c)
+		}
 	}
 
 	if hasCritical && *failOnLint {
@@ -436,7 +461,7 @@ func runProxy(args []string) {
 	pubKeyPath := fs.String("pub-key", "agbom.pub", "Path to pinned Ed25519 public key")
 	serverName := fs.String("server-name", "", "MCP server component name inside AgBOM (single-server mode)")
 	cmdBin := fs.String("cmd", "", "Upstream stdio MCP server binary")
-	cmdArgs := fs.String("args", "", "Space-separated arguments for upstream MCP server")
+	cmdArgs := fs.String("args", "", "Arguments for upstream MCP server (supports single/double quotes)")
 	listenAddr := fs.String("listen", "", "Listen address (e.g. 127.0.0.1:8080) for Streamable HTTP proxy/gateway mode")
 	upstreamURL := fs.String("upstream-url", "", "Upstream Streamable HTTP MCP endpoint URL (single-server HTTP mode)")
 	routesSpec := fs.String("routes", "", "Comma-separated multi-server gateway routes: name1=https://...,name2=https://...")
@@ -535,7 +560,8 @@ func runProxy(args []string) {
 			fatal("init http gateway: %v", err)
 		}
 		fmt.Fprintf(os.Stderr, "agbom-gate multi-server HTTP gateway listening on %s (%d routes)\n", *listenAddr, len(routes))
-		if err := http.ListenAndServe(*listenAddr, gw); err != nil {
+		srv := newHardenedHTTPServer(*listenAddr, gw)
+		if err := srv.ListenAndServe(); err != nil {
 			fatal("http gateway error: %v", err)
 		}
 		return
@@ -561,7 +587,8 @@ func runProxy(args []string) {
 		mux.Handle("/mcp", hp)
 		mux.Handle("/", hp)
 		fmt.Fprintf(os.Stderr, "agbom-gate HTTP quarantine proxy listening on %s -> %s (server=%s)\n", *listenAddr, *upstreamURL, *serverName)
-		if err := http.ListenAndServe(*listenAddr, mux); err != nil {
+		srv := newHardenedHTTPServer(*listenAddr, mux)
+		if err := srv.ListenAndServe(); err != nil {
 			fatal("http proxy server error: %v", err)
 		}
 		return
@@ -576,9 +603,9 @@ func runProxy(args []string) {
 		qp.SetApprovalHook(approvalHook)
 	}
 
-	var splitArgs []string
-	if strings.TrimSpace(*cmdArgs) != "" {
-		splitArgs = strings.Fields(*cmdArgs)
+	splitArgs, err := mcpclient.SplitCommandArgs(*cmdArgs)
+	if err != nil {
+		fatal("parse --args: %v", err)
 	}
 	cmd := exec.Command(*cmdBin, splitArgs...)
 	upIn, err := cmd.StdinPipe()
@@ -603,6 +630,16 @@ func runProxy(args []string) {
 
 	if err := qp.Serve(os.Stdin, os.Stdout, upIn, upOut); err != nil {
 		fatal("proxy loop error: %v", err)
+	}
+}
+
+func newHardenedHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1 MiB
 	}
 }
 

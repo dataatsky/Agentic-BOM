@@ -27,8 +27,16 @@ type HTTPConfig struct {
 	OBOToken               string
 	OBOTokenCmd            string
 	AllowInsecureLocalhost bool
-	Timeout                time.Duration
-	HTTPClient             *http.Client // Optional override (primarily for tests)
+	Timeout                time.Duration // Per-RPC timeout (defaults to 30s; does not cap SSE stream lifetime)
+	HTTPClient             *http.Client  // Optional override (primarily for tests)
+}
+
+// EffectiveRPCTimeout returns the configured per-RPC timeout or a 30s default.
+func (c HTTPConfig) EffectiveRPCTimeout() time.Duration {
+	if c.Timeout > 0 {
+		return c.Timeout
+	}
+	return 30 * time.Second
 }
 
 // ValidateEndpointURL enforces HTTPS unless AllowInsecureLocalhost is set for loopback hosts.
@@ -52,6 +60,8 @@ func ValidateEndpointURL(rawURL string, allowInsecureLocalhost bool) error {
 }
 
 // BuildHTTPClient constructs an *http.Client enforcing TLS 1.2+ and optional mTLS/custom CA.
+// Transport-level handshake and response-header timeouts are set instead of http.Client.Timeout
+// so long-lived GET /mcp SSE streams are not prematurely disconnected.
 func BuildHTTPClient(cfg HTTPConfig) (*http.Client, error) {
 	if cfg.EndpointURL != "" {
 		if err := ValidateEndpointURL(cfg.EndpointURL, cfg.AllowInsecureLocalhost); err != nil {
@@ -89,14 +99,13 @@ func BuildHTTPClient(cfg HTTPConfig) (*http.Client, error) {
 		tlsCfg.RootCAs = pool
 	}
 
-	timeout := cfg.Timeout
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
+	hdrTimeout := cfg.EffectiveRPCTimeout()
 	return &http.Client{
-		Timeout: timeout,
 		Transport: &http.Transport{
-			TLSClientConfig: tlsCfg,
+			TLSClientConfig:       tlsCfg,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: hdrTimeout,
+			IdleConnTimeout:       90 * time.Second,
 		},
 	}, nil
 }
@@ -108,7 +117,13 @@ func ResolveOBOToken(ctx context.Context, cfg HTTPConfig) (string, error) {
 		return tok, nil
 	}
 	if cmdLine := strings.TrimSpace(cfg.OBOTokenCmd); cmdLine != "" {
-		parts := strings.Fields(cmdLine)
+		parts, err := SplitCommandArgs(cmdLine)
+		if err != nil {
+			return "", fmt.Errorf("parse obo-token-cmd: %w", err)
+		}
+		if len(parts) == 0 {
+			return "", errors.New("empty obo-token-cmd")
+		}
 		cmd := exec.CommandContext(ctx, parts[0], parts[1:]...)
 		out, err := cmd.Output()
 		if err != nil {
@@ -130,14 +145,18 @@ func FetchToolsHTTP(ctx context.Context, cfg HTTPConfig) ([]json.RawMessage, err
 	if err != nil {
 		return nil, err
 	}
+	rpcTimeout := cfg.EffectiveRPCTimeout()
 
 	var sessionID string
 	postRPC := func(req rpcRequest) (*rpcResponse, error) {
+		reqCtx, cancel := context.WithTimeout(ctx, rpcTimeout)
+		defer cancel()
+
 		body, err := json.Marshal(req)
 		if err != nil {
 			return nil, err
 		}
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.EndpointURL, bytes.NewReader(body))
+		httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, cfg.EndpointURL, bytes.NewReader(body))
 		if err != nil {
 			return nil, err
 		}
@@ -146,7 +165,7 @@ func FetchToolsHTTP(ctx context.Context, cfg HTTPConfig) ([]json.RawMessage, err
 		if sessionID != "" {
 			httpReq.Header.Set("Mcp-Session-Id", sessionID)
 		}
-		tok, err := ResolveOBOToken(ctx, cfg)
+		tok, err := ResolveOBOToken(reqCtx, cfg)
 		if err != nil {
 			return nil, err
 		}
@@ -255,7 +274,6 @@ func readJSONRPCFromSSE(r io.Reader) (*rpcResponse, error) {
 		if err := json.Unmarshal([]byte(payload), &rpcResp); err != nil {
 			return nil, false, nil
 		}
-		// Ignore server notifications inside the SSE response stream.
 		if len(rpcResp.ID) == 0 || string(rpcResp.ID) == "null" {
 			return nil, false, nil
 		}
