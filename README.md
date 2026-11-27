@@ -239,5 +239,6 @@ Included in [`.github/workflows/agbom-diff.yml`](.github/workflows/agbom-diff.ym
 │   └── vectors/                 # Standalone golden canonicalization & attack payload fixtures
 ├── .github/workflows/           # CI PR authority-diff workflow with sticky PR comment posting
 ├── .agents/                     # Antigravity workspace security rules & skills (/verify-agbom-gate, /extend-agbom-gate)
+├── docs/tutorial.html           # Interactive 6-module hands-on browser tutorial (JCS, DSSE, Quarantine Proxy, Diff & Reconcile)
 └── AGENTS.md                    # Workspace architecture & commands
 ```
